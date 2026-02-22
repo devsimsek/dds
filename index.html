@@ -606,6 +606,15 @@
             .gdot-ind.on {
                 display: inline-block;
             }
+            .save-ind {
+                font-size: 10px;
+                color: var(--primary);
+                opacity: 0;
+                transition: opacity 0.5s;
+            }
+            .save-ind.on {
+                opacity: 1;
+            }
         </style>
     </head>
     <body>
@@ -646,6 +655,24 @@
                                 d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"
                             />
                             <polyline points="13 2 13 9 20 9" />
+                        </svg>
+                    </button>
+                    <button
+                        class="btn btn-i"
+                        id="btn-open"
+                        title="Open File (.dbml or .sql)"
+                    >
+                        <svg
+                            width="15"
+                            height="15"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                        >
+                            <path
+                                d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"
+                            />
                         </svg>
                     </button>
                 </div>
@@ -950,9 +977,12 @@
                         >Grid ON · 20px</span
                     >
                 </div>
-                <div class="si"><span id="s-cur">Ln 1, Col 1</span></div>
+                <div class="si"><span id="s-cur">Ln 1, Col 1</span><span class="save-ind" id="save-ind" style="margin-left:8px">● Saved</span></div>
             </div>
         </div>
+
+        <!-- Hidden file input for Open File -->
+        <input type="file" id="file-input" accept=".dbml,.sql" style="display:none" />
 
         <!-- Export Modal -->
         <div class="modal" id="modal">
@@ -1077,6 +1107,34 @@
 
             function getVal() {
                 return ED ? ED.getValue() : "";
+            }
+
+            // ══════════════════════════════════════════════
+            // LOCAL STORAGE AUTO-SAVE
+            // ══════════════════════════════════════════════
+            const LS_KEY = "dds-workspace";
+            let _saveTimer = null;
+
+            function saveToLS() {
+                try {
+                    localStorage.setItem(LS_KEY, getVal());
+                } catch (e) {
+                    console.warn("DDS: localStorage save failed:", e);
+                }
+                const ind = document.getElementById("save-ind");
+                if (ind) {
+                    ind.classList.add("on");
+                    clearTimeout(ind._t);
+                    ind._t = setTimeout(
+                        () => ind.classList.remove("on"),
+                        2000,
+                    );
+                }
+            }
+
+            function scheduleSave() {
+                clearTimeout(_saveTimer);
+                _saveTimer = setTimeout(saveToLS, 800);
             }
 
             // ══════════════════════════════════════════════
@@ -1369,8 +1427,392 @@
             }
 
             // ══════════════════════════════════════════════
-            // DIAGRAM
+            // SQL → DBML IMPORT
             // ══════════════════════════════════════════════
+            function splitColDefs(body) {
+                const parts = [];
+                let depth = 0,
+                    cur = "";
+                for (const ch of body) {
+                    if (ch === "(") depth++;
+                    else if (ch === ")") depth--;
+                    if (ch === "," && depth === 0) {
+                        parts.push(cur.trim());
+                        cur = "";
+                    } else {
+                        cur += ch;
+                    }
+                }
+                if (cur.trim()) parts.push(cur.trim());
+                return parts;
+            }
+
+            function normalizeSQLType(t) {
+                const tu = t.toUpperCase().trim();
+                const map = {
+                    INT: "integer",
+                    "INT UNSIGNED": "integer",
+                    INTEGER: "integer",
+                    BIGINT: "biginteger",
+                    "BIGINT UNSIGNED": "biginteger",
+                    SMALLINT: "smallinteger",
+                    "SMALLINT UNSIGNED": "smallinteger",
+                    TINYINT: "tinyinteger",
+                    "TINYINT(1)": "boolean",
+                    BOOL: "boolean",
+                    BOOLEAN: "boolean",
+                    FLOAT: "float",
+                    REAL: "real",
+                    DOUBLE: "double",
+                    "DOUBLE PRECISION": "double",
+                    DATE: "date",
+                    TIME: "time",
+                    DATETIME: "datetime",
+                    TIMESTAMP: "timestamp",
+                    "TIMESTAMP WITHOUT TIME ZONE": "timestamp",
+                    "TIMESTAMP WITH TIME ZONE": "timestamp",
+                    TIMESTAMPTZ: "timestamp",
+                    JSON: "json",
+                    JSONB: "jsonb",
+                    TEXT: "text",
+                    LONGTEXT: "longtext",
+                    MEDIUMTEXT: "mediumtext",
+                    TINYTEXT: "tinytext",
+                    BLOB: "blob",
+                    BYTEA: "blob",
+                    UUID: "uuid",
+                    "CHAR(36)": "uuid",
+                    SERIAL: "integer",
+                    BIGSERIAL: "biginteger",
+                    SMALLSERIAL: "smallinteger",
+                    "CHARACTER VARYING": "varchar",
+                };
+                if (map[tu]) return map[tu];
+                return t.toLowerCase();
+            }
+
+            function sqlToDBML(sql) {
+                sql = sql
+                    .replace(/\r\n/g, "\n")
+                    .replace(/\r/g, "\n");
+                // Remove block comments
+                sql = sql.replace(/\/\*[\s\S]*?\*\//g, " ");
+                // Remove line comments
+                sql = sql.replace(/--[^\n]*/g, "");
+
+                const tables = [];
+                const fkRels = [];
+
+                // Find CREATE TABLE statements using bracket matching
+                const ctRe =
+                    /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?/gi;
+                let ctMatch;
+                while ((ctMatch = ctRe.exec(sql)) !== null) {
+                    const startIdx =
+                        ctMatch.index + ctMatch[0].length;
+                    const namePart = sql.slice(startIdx);
+                    const nameMatch = namePart.match(
+                        /^(?:`([^`]+)`|"([^"]+)"|(\w+))\s*\(/,
+                    );
+                    if (!nameMatch) continue;
+                    const tableName =
+                        nameMatch[1] || nameMatch[2] || nameMatch[3];
+
+                    // Find body between matching parentheses
+                    const parenStart =
+                        startIdx + namePart.indexOf("(");
+                    let depth = 0,
+                        i = parenStart;
+                    for (; i < sql.length; i++) {
+                        if (sql[i] === "(") depth++;
+                        else if (sql[i] === ")") {
+                            depth--;
+                            if (depth === 0) break;
+                        }
+                    }
+                    const body = sql.slice(parenStart + 1, i);
+                    const parts = splitColDefs(body);
+
+                    const cols = [];
+                    const tablePKs = [];
+                    const tableUniques = [];
+
+                    parts.forEach((part) => {
+                        part = part.trim();
+                        if (!part) return;
+
+                        // Skip plain KEY/INDEX definitions
+                        if (/^(KEY|INDEX)\s/i.test(part)) return;
+
+                        // PRIMARY KEY table constraint
+                        if (
+                            /^(CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*\(/i.test(
+                                part,
+                            )
+                        ) {
+                            const pkm = part.match(
+                                /PRIMARY\s+KEY\s*\(([^)]+)\)/i,
+                            );
+                            if (pkm)
+                                pkm[1]
+                                    .split(",")
+                                    .forEach((c) =>
+                                        tablePKs.push(
+                                            c
+                                                .trim()
+                                                .replace(/[`"]/g, ""),
+                                        ),
+                                    );
+                            return;
+                        }
+
+                        // UNIQUE table constraint
+                        // Matches: [CONSTRAINT name] UNIQUE [KEY|INDEX] [index_name] (col, ...)
+                        if (
+                            /^(CONSTRAINT\s+\S+\s+)?UNIQUE\s*(?:KEY|INDEX)?\s*(?:`[^`]+`|"\w+"|\w+)?\s*\(/i.test(
+                                part,
+                            )
+                        ) {
+                            const um = part.match(
+                                /UNIQUE\s*(?:KEY|INDEX)?\s*(?:`[^`]+`|"\w+"|\w+)?\s*\(([^)]+)\)/i,
+                            );
+                            if (um) {
+                                const ucols = um[1]
+                                    .split(",")
+                                    .map((c) =>
+                                        c.trim().replace(/[`"]/g, ""),
+                                    );
+                                if (ucols.length === 1)
+                                    tableUniques.push(ucols[0]);
+                            }
+                            return;
+                        }
+
+                        // FOREIGN KEY table constraint
+                        if (
+                            /^(CONSTRAINT\s+\S+\s+)?FOREIGN\s+KEY/i.test(
+                                part,
+                            )
+                        ) {
+                            const fkm = part.match(
+                                /FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s*(?:`([^`]+)`|"([^"]+)"|(\w+))\s*\(([^)]+)\)/i,
+                            );
+                            if (fkm) {
+                                const fromCol = fkm[1]
+                                    .trim()
+                                    .replace(/[`"]/g, "");
+                                const toTable =
+                                    fkm[2] || fkm[3] || fkm[4];
+                                const toCol = fkm[5]
+                                    .trim()
+                                    .replace(/[`"]/g, "");
+                                fkRels.push({
+                                    from: `${tableName}.${fromCol}`,
+                                    to: `${toTable}.${toCol}`,
+                                });
+                            }
+                            return;
+                        }
+
+                        // CHECK constraint
+                        if (
+                            /^(CONSTRAINT\s+\S+\s+)?CHECK\s*\(/i.test(
+                                part,
+                            )
+                        )
+                            return;
+
+                        // Column definition
+                        const colm = part.match(
+                            /^(?:`([^`]+)`|"([^"]+)"|(\w+))\s+(.+)$/is,
+                        );
+                        if (!colm) return;
+                        const colName =
+                            colm[1] || colm[2] || colm[3];
+                        const skipKw = [
+                            "PRIMARY",
+                            "UNIQUE",
+                            "KEY",
+                            "INDEX",
+                            "CONSTRAINT",
+                            "FOREIGN",
+                            "CHECK",
+                        ];
+                        if (
+                            skipKw.includes(colName.toUpperCase())
+                        )
+                            return;
+
+                        const rest = colm[4];
+                        // Extract type (handles parens like VARCHAR(255), DECIMAL(10,2))
+                        const typeMatch = rest.match(
+                            /^(\w+(?:\s*\([^)]*\))?)/i,
+                        );
+                        let colType = typeMatch
+                            ? typeMatch[1].trim()
+                            : rest.split(/\s/)[0];
+                        const restAfter = rest.slice(
+                            colType.length,
+                        );
+
+                        const isSerial =
+                            /^(BIGSERIAL|SMALLSERIAL|SERIAL)$/i.test(
+                                colType,
+                            );
+                        const isPK =
+                            /\bPRIMARY\s+KEY\b/i.test(restAfter);
+                        const isNN =
+                            /\bNOT\s+NULL\b/i.test(restAfter) ||
+                            isPK ||
+                            isSerial;
+                        const isUQ =
+                            /\bUNIQUE\b/i.test(restAfter);
+                        const isAI =
+                            /\bAUTO_INCREMENT\b/i.test(
+                                restAfter,
+                            ) || isSerial;
+
+                        // Default value (handles standard SQL string escaping with '')
+                        let defVal = null;
+                        const defm = restAfter.match(
+                            /\bDEFAULT\s+(`[^`]*`|'(?:[^']|'')*'|-?\d+(?:\.\d+)?|NULL|TRUE|FALSE|CURRENT_TIMESTAMP(?:\(\))?|\w+(?:\(\))?)/i,
+                        );
+                        if (defm) {
+                            defVal = defm[1];
+                            if (
+                                /^CURRENT_TIMESTAMP/i.test(defVal)
+                            )
+                                defVal = "`now()`";
+                            else if (
+                                /^(NULL|TRUE|FALSE)$/i.test(defVal)
+                            )
+                                defVal = defVal.toLowerCase();
+                        }
+
+                        if (isPK) tablePKs.push(colName);
+
+                        // Inline REFERENCES (PostgreSQL column-level FK)
+                        const inlineRef = restAfter.match(
+                            /\bREFERENCES\s+(?:`([^`]+)`|"([^"]+)"|(\w+))\s*\(([^)]+)\)/i,
+                        );
+                        if (inlineRef) {
+                            const toTable =
+                                inlineRef[1] ||
+                                inlineRef[2] ||
+                                inlineRef[3];
+                            const toCol = inlineRef[4]
+                                .trim()
+                                .replace(/[`"]/g, "");
+                            fkRels.push({
+                                from: `${tableName}.${colName}`,
+                                to: `${toTable}.${toCol}`,
+                            });
+                        }
+
+                        cols.push({
+                            name: colName,
+                            type: normalizeSQLType(colType),
+                            pk: isPK,
+                            nn: isNN,
+                            uq: isUQ,
+                            ai: isAI,
+                            dv: defVal,
+                        });
+                    });
+
+                    // Apply table-level PRIMARY KEY and UNIQUE
+                    cols.forEach((c) => {
+                        if (tablePKs.includes(c.name)) {
+                            c.pk = true;
+                            c.nn = true;
+                        }
+                        if (tableUniques.includes(c.name))
+                            c.uq = true;
+                    });
+
+                    if (tableName && cols.length)
+                        tables.push({ name: tableName, cols });
+                }
+
+                // Parse ALTER TABLE … ADD FOREIGN KEY
+                const alterRe =
+                    /ALTER\s+TABLE\s+(?:`([^`]+)`|"([^"]+)"|(\w+))\s+ADD\s+(?:CONSTRAINT\s+(?:`[^`]+`|"\w+"|\S+)\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s*(?:`([^`]+)`|"([^"]+)"|(\w+))\s*\(([^)]+)\)/gi;
+                let altm;
+                while ((altm = alterRe.exec(sql)) !== null) {
+                    const fromTable =
+                        altm[1] || altm[2] || altm[3];
+                    const fromCol = altm[4]
+                        .trim()
+                        .replace(/[`"]/g, "");
+                    const toTable = altm[5] || altm[6] || altm[7];
+                    const toCol = altm[8]
+                        .trim()
+                        .replace(/[`"]/g, "");
+                    fkRels.push({
+                        from: `${fromTable}.${fromCol}`,
+                        to: `${toTable}.${toCol}`,
+                    });
+                }
+
+                if (!tables.length)
+                    return "// No tables found in SQL file\n";
+
+                let dbml = "// Imported from SQL\n\n";
+                tables.forEach((t) => {
+                    dbml += `Table ${t.name} {\n`;
+                    t.cols.forEach((c) => {
+                        const attrs = [];
+                        if (c.pk) attrs.push("pk");
+                        if (c.ai) attrs.push("increment");
+                        if (c.nn && !c.pk) attrs.push("not null");
+                        if (c.uq && !c.pk) attrs.push("unique");
+                        if (c.dv !== null)
+                            attrs.push(`default: ${c.dv}`);
+                        const fk = fkRels.find(
+                            (r) => r.from === `${t.name}.${c.name}`,
+                        );
+                        if (fk) attrs.push(`ref: > ${fk.to}`);
+                        dbml += `  ${c.name} ${c.type}`;
+                        if (attrs.length)
+                            dbml += ` [${attrs.join(", ")}]`;
+                        dbml += "\n";
+                    });
+                    dbml += "}\n\n";
+                });
+                return dbml.trimEnd() + "\n";
+            }
+
+            // ══════════════════════════════════════════════
+            // FILE IMPORT
+            // ══════════════════════════════════════════════
+            function openFile() {
+                document.getElementById("file-input").click();
+            }
+
+            document
+                .getElementById("file-input")
+                .addEventListener("change", function (e) {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = function (ev) {
+                        if (!ED) return;
+                        const content = ev.target.result;
+                        const name = file.name.toLowerCase();
+                        let dbml = content;
+                        if (name.endsWith(".sql")) {
+                            dbml = sqlToDBML(content);
+                        }
+                        ED.setValue(dbml);
+                        ED.setPosition({ lineNumber: 1, column: 1 });
+                        render();
+                    };
+                    reader.readAsText(file);
+                    // Reset so the same file can be re-opened
+                    this.value = "";
+                });
+
+
             function render() {
                 const res = parseDBML(getVal());
                 ST.tables = res.tables;
@@ -1708,7 +2150,11 @@ Table reviews [headercolor: #34495E] {
             function newDia() {
                 if (getVal().trim() && !confirm("Clear diagram?")) return;
                 ED?.setValue("");
-                render();
+                try {
+                    localStorage.removeItem(LS_KEY);
+                } catch (e) {
+                    console.warn("DDS: localStorage clear failed:", e);
+                }                render();
             }
 
             // ══════════════════════════════════════════════
@@ -1865,6 +2311,9 @@ Table reviews [headercolor: #34495E] {
             document
                 .getElementById("btn-load")
                 .addEventListener("click", loadEx);
+            document
+                .getElementById("btn-open")
+                .addEventListener("click", openFile);
             document
                 .getElementById("btn-validate")
                 .addEventListener("click", render);
@@ -2465,6 +2914,7 @@ Table reviews [headercolor: #34495E] {
                     // ── Editor events ──
                     ED.onDidChangeModelContent(function () {
                         render();
+                        scheduleSave();
                         var errs = parseDBML(getVal()).errors;
                         document.getElementById("estatus").textContent =
                             errs.length
@@ -2490,8 +2940,19 @@ Table reviews [headercolor: #34495E] {
                                 monaco.editor.setTheme(getMonacoTheme());
                         });
 
-                    // Load example schema
-                    loadEx();
+                    // Load from localStorage if available, otherwise load example
+                    try {
+                        const _saved = localStorage.getItem(LS_KEY);
+                        if (_saved && _saved.trim()) {
+                            ED.setValue(_saved);
+                            render();
+                        } else {
+                            loadEx();
+                        }
+                    } catch (e) {
+                        console.warn("DDS: localStorage read failed:", e);
+                        loadEx();
+                    }
                 } catch (err) {
                     // Show error in editor area if init fails
                     document.getElementById("econ").innerHTML =
